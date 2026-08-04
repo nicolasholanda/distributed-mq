@@ -1,0 +1,6 @@
+dependencies {
+    api project(':mq-common')
+    implementation "io.netty:netty-transport:${nettyVersion}"
+    implementation "io.netty:netty-codec:${nettyVersion}"
+    runtimeOnly "ch.qos.logback:logback-classic:${logbackVersion}"
+}

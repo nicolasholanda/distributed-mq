@@ -1,0 +1,14 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation project(':mq-common')
+    implementation project(':mq-broker')
+    implementation project(':mq-client')
+    runtimeOnly "ch.qos.logback:logback-classic:${logbackVersion}"
+}
+
+application {
+    mainClass = 'com.github.nicolasholanda.mq.cli.MqCli'
+}

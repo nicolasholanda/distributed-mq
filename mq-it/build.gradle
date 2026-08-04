@@ -1,0 +1,6 @@
+dependencies {
+    testImplementation project(':mq-common')
+    testImplementation project(':mq-broker')
+    testImplementation project(':mq-client')
+    testRuntimeOnly "ch.qos.logback:logback-classic:${logbackVersion}"
+}

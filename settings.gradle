@@ -1,1 +1,8 @@
 rootProject.name = 'distributed-mq'
+
+include 'mq-common'
+include 'mq-broker'
+include 'mq-client'
+include 'mq-cli'
+include 'mq-it'
+include 'mq-admin'

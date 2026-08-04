@@ -1,7 +1,13 @@
 HELP.md
+commits.md
 .gradle
 .claude
 build/
+data/
+*.log
+*.index
+*.timeindex
+
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/
