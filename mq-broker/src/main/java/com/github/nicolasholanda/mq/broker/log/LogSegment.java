@@ -1,5 +1,6 @@
 package com.github.nicolasholanda.mq.broker.log;
 
+import com.github.nicolasholanda.mq.common.record.Record;
 import com.github.nicolasholanda.mq.common.record.RecordBatch;
 import java.io.Closeable;
 import java.io.File;
@@ -20,6 +21,7 @@ public final class LogSegment implements Closeable {
     private final long baseOffset;
     private final FileRecords records;
     private final OffsetIndex offsetIndex;
+    private final TimeIndex timeIndex;
     private final int indexIntervalBytes;
     private final long createdAtMs;
 
@@ -28,11 +30,12 @@ public final class LogSegment implements Closeable {
     private long offsetOfMaxTimestamp = -1;
     private int bytesSinceLastIndexEntry;
 
-    private LogSegment(long baseOffset, FileRecords records, OffsetIndex offsetIndex,
+    private LogSegment(long baseOffset, FileRecords records, OffsetIndex offsetIndex, TimeIndex timeIndex,
             int indexIntervalBytes, long createdAtMs) {
         this.baseOffset = baseOffset;
         this.records = records;
         this.offsetIndex = offsetIndex;
+        this.timeIndex = timeIndex;
         this.indexIntervalBytes = indexIntervalBytes;
         this.createdAtMs = createdAtMs;
         this.nextOffset = baseOffset;
@@ -46,7 +49,8 @@ public final class LogSegment implements Closeable {
             throws IOException {
         File logFile = new File(dir, fileName(baseOffset, LOG_SUFFIX));
         LogSegment segment = new LogSegment(baseOffset, FileRecords.open(logFile),
-                OffsetIndex.open(dir, baseOffset, maxIndexSize), indexIntervalBytes, System.currentTimeMillis());
+                OffsetIndex.open(dir, baseOffset, maxIndexSize), TimeIndex.open(dir, baseOffset, maxIndexSize),
+                indexIntervalBytes, System.currentTimeMillis());
         segment.recoverState();
         return segment;
     }
@@ -69,6 +73,7 @@ public final class LogSegment implements Closeable {
 
     public void rebuildIndex() throws IOException {
         offsetIndex.truncate();
+        timeIndex.truncate();
         bytesSinceLastIndexEntry = 0;
         nextOffset = baseOffset;
         maxTimestamp = -1;
@@ -83,6 +88,10 @@ public final class LogSegment implements Closeable {
         if (bytesSinceLastIndexEntry >= indexIntervalBytes && !offsetIndex.isFull()
                 && batch.baseOffset() > offsetIndex.lastOffset()) {
             offsetIndex.append(batch.baseOffset(), position);
+            if (!timeIndex.isFull() && batch.maxTimestamp() >= timeIndex.lastTimestamp()
+                    && batch.lastOffset() > timeIndex.lastOffset()) {
+                timeIndex.append(batch.maxTimestamp(), batch.lastOffset());
+            }
             bytesSinceLastIndexEntry = 0;
         }
         bytesSinceLastIndexEntry += sizeInBytes;
@@ -166,6 +175,7 @@ public final class LogSegment implements Closeable {
         }
         records.truncateTo(position);
         offsetIndex.truncateTo(offset);
+        timeIndex.truncateTo(offset);
         nextOffset = newNextOffset;
         bytesSinceLastIndexEntry = 0;
     }
@@ -206,24 +216,59 @@ public final class LogSegment implements Closeable {
         return offsetIndex;
     }
 
+    public TimeIndex timeIndex() {
+        return timeIndex;
+    }
+
+    public OffsetAndTimestamp offsetForTimestamp(long targetTimestamp) throws IOException {
+        if (maxTimestamp < targetTimestamp) {
+            return OffsetAndTimestamp.NONE;
+        }
+        IndexEntry entry = timeIndex.lookup(targetTimestamp);
+        long searchFrom = entry.offset() < 0 ? baseOffset : entry.offset();
+        int position = positionOf(searchFrom);
+        if (position < 0) {
+            return OffsetAndTimestamp.NONE;
+        }
+        Iterator<FileRecords.BatchPosition> iterator = records.batchIterator(position);
+        while (iterator.hasNext()) {
+            RecordBatch batch = iterator.next().batch();
+            if (batch.maxTimestamp() < targetTimestamp) {
+                continue;
+            }
+            long baseTimestamp = batch.baseTimestamp();
+            for (Record record : batch.records()) {
+                if (baseTimestamp + record.timestampDelta() >= targetTimestamp) {
+                    return new OffsetAndTimestamp(batch.baseOffset() + record.offsetDelta(),
+                            baseTimestamp + record.timestampDelta());
+                }
+            }
+        }
+        return OffsetAndTimestamp.NONE;
+    }
+
     public void flush() throws IOException {
         records.flush();
         offsetIndex.flush();
+        timeIndex.flush();
     }
 
     public void delete() throws IOException {
         records.close();
         offsetIndex.delete();
+        timeIndex.delete();
         Files.deleteIfExists(records.file().toPath());
     }
 
     public void trim() throws IOException {
         offsetIndex.trimToValidSize();
+        timeIndex.trimToValidSize();
     }
 
     @Override
     public void close() throws IOException {
         records.close();
         offsetIndex.close();
+        timeIndex.close();
     }
 }
