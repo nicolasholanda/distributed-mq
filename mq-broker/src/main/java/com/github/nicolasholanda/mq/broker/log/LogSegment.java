@@ -14,25 +14,39 @@ public final class LogSegment implements Closeable {
 
     public static final String LOG_SUFFIX = ".log";
     public static final int OFFSET_FILE_NAME_LENGTH = 20;
+    public static final int DEFAULT_INDEX_INTERVAL_BYTES = 4096;
+    public static final int DEFAULT_MAX_INDEX_SIZE = 10 * 1024 * 1024;
 
     private final long baseOffset;
     private final FileRecords records;
+    private final OffsetIndex offsetIndex;
+    private final int indexIntervalBytes;
     private final long createdAtMs;
 
     private long nextOffset;
     private long maxTimestamp = -1;
     private long offsetOfMaxTimestamp = -1;
+    private int bytesSinceLastIndexEntry;
 
-    private LogSegment(long baseOffset, FileRecords records, long createdAtMs) {
+    private LogSegment(long baseOffset, FileRecords records, OffsetIndex offsetIndex,
+            int indexIntervalBytes, long createdAtMs) {
         this.baseOffset = baseOffset;
         this.records = records;
+        this.offsetIndex = offsetIndex;
+        this.indexIntervalBytes = indexIntervalBytes;
         this.createdAtMs = createdAtMs;
         this.nextOffset = baseOffset;
     }
 
     public static LogSegment open(File dir, long baseOffset) throws IOException {
+        return open(dir, baseOffset, DEFAULT_INDEX_INTERVAL_BYTES, DEFAULT_MAX_INDEX_SIZE);
+    }
+
+    public static LogSegment open(File dir, long baseOffset, int indexIntervalBytes, int maxIndexSize)
+            throws IOException {
         File logFile = new File(dir, fileName(baseOffset, LOG_SUFFIX));
-        LogSegment segment = new LogSegment(baseOffset, FileRecords.open(logFile), System.currentTimeMillis());
+        LogSegment segment = new LogSegment(baseOffset, FileRecords.open(logFile),
+                OffsetIndex.open(dir, baseOffset, maxIndexSize), indexIntervalBytes, System.currentTimeMillis());
         segment.recoverState();
         return segment;
     }
@@ -50,9 +64,28 @@ public final class LogSegment implements Closeable {
         if (valid < records.sizeInBytes()) {
             records.truncateTo(valid);
         }
+        rebuildIndex();
+    }
+
+    public void rebuildIndex() throws IOException {
+        offsetIndex.truncate();
+        bytesSinceLastIndexEntry = 0;
+        nextOffset = baseOffset;
+        maxTimestamp = -1;
+        offsetOfMaxTimestamp = -1;
         for (FileRecords.BatchPosition batchPosition : records.batchesFrom(0)) {
             observe(batchPosition.batch());
+            maybeIndex(batchPosition.batch(), batchPosition.position(), batchPosition.sizeInBytes());
         }
+    }
+
+    private void maybeIndex(RecordBatch batch, int position, int sizeInBytes) {
+        if (bytesSinceLastIndexEntry >= indexIntervalBytes && !offsetIndex.isFull()
+                && batch.baseOffset() > offsetIndex.lastOffset()) {
+            offsetIndex.append(batch.baseOffset(), position);
+            bytesSinceLastIndexEntry = 0;
+        }
+        bytesSinceLastIndexEntry += sizeInBytes;
     }
 
     private void observe(RecordBatch batch) {
@@ -68,8 +101,10 @@ public final class LogSegment implements Closeable {
             throw new IllegalArgumentException("Batch base offset " + batch.baseOffset()
                     + " is behind the segment next offset " + nextOffset);
         }
+        int position = records.sizeInBytes();
         int written = records.append(batch);
         observe(batch);
+        maybeIndex(batch, position, written);
         return new LogAppendInfo(batch.baseOffset(), batch.lastOffset(), batch.maxTimestamp(),
                 System.currentTimeMillis(), batch.recordCount(), written);
     }
@@ -105,7 +140,9 @@ public final class LogSegment implements Closeable {
     }
 
     public int positionOf(long targetOffset) throws IOException {
-        Iterator<FileRecords.BatchPosition> iterator = records.batchIterator(0);
+        IndexEntry entry = offsetIndex.lookup(targetOffset);
+        int startPosition = entry.offset() < 0 ? 0 : entry.position();
+        Iterator<FileRecords.BatchPosition> iterator = records.batchIterator(startPosition);
         while (iterator.hasNext()) {
             FileRecords.BatchPosition batchPosition = iterator.next();
             if (batchPosition.batch().lastOffset() >= targetOffset) {
@@ -128,7 +165,9 @@ public final class LogSegment implements Closeable {
             newNextOffset = batchPosition.batch().lastOffset() + 1;
         }
         records.truncateTo(position);
+        offsetIndex.truncateTo(offset);
         nextOffset = newNextOffset;
+        bytesSinceLastIndexEntry = 0;
     }
 
     public long baseOffset() {
@@ -163,17 +202,28 @@ public final class LogSegment implements Closeable {
         return records.file();
     }
 
+    public OffsetIndex offsetIndex() {
+        return offsetIndex;
+    }
+
     public void flush() throws IOException {
         records.flush();
+        offsetIndex.flush();
     }
 
     public void delete() throws IOException {
         records.close();
+        offsetIndex.delete();
         Files.deleteIfExists(records.file().toPath());
+    }
+
+    public void trim() throws IOException {
+        offsetIndex.trimToValidSize();
     }
 
     @Override
     public void close() throws IOException {
         records.close();
+        offsetIndex.close();
     }
 }
