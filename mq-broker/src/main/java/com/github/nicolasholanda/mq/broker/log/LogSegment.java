@@ -1,5 +1,6 @@
 package com.github.nicolasholanda.mq.broker.log;
 
+import com.github.nicolasholanda.mq.common.record.CorruptRecordException;
 import com.github.nicolasholanda.mq.common.record.Record;
 import com.github.nicolasholanda.mq.common.record.RecordBatch;
 import java.io.Closeable;
@@ -29,6 +30,7 @@ public final class LogSegment implements Closeable {
     private long maxTimestamp = -1;
     private long offsetOfMaxTimestamp = -1;
     private int bytesSinceLastIndexEntry;
+    private boolean needsRecovery;
 
     private LogSegment(long baseOffset, FileRecords records, OffsetIndex offsetIndex, TimeIndex timeIndex,
             int indexIntervalBytes, long createdAtMs) {
@@ -47,11 +49,20 @@ public final class LogSegment implements Closeable {
 
     public static LogSegment open(File dir, long baseOffset, int indexIntervalBytes, int maxIndexSize)
             throws IOException {
+        return open(dir, baseOffset, indexIntervalBytes, maxIndexSize, true);
+    }
+
+    public static LogSegment open(File dir, long baseOffset, int indexIntervalBytes, int maxIndexSize,
+            boolean recover) throws IOException {
         File logFile = new File(dir, fileName(baseOffset, LOG_SUFFIX));
         LogSegment segment = new LogSegment(baseOffset, FileRecords.open(logFile),
                 OffsetIndex.open(dir, baseOffset, maxIndexSize), TimeIndex.open(dir, baseOffset, maxIndexSize),
                 indexIntervalBytes, System.currentTimeMillis());
-        segment.recoverState();
+        if (recover) {
+            segment.recoverAndRebuildIndexes();
+        } else {
+            segment.loadStateFromIndexes();
+        }
         return segment;
     }
 
@@ -63,15 +74,40 @@ public final class LogSegment implements Closeable {
         return Long.parseLong(fileName.substring(0, OFFSET_FILE_NAME_LENGTH));
     }
 
-    private void recoverState() throws IOException {
+    public void recoverAndRebuildIndexes() throws IOException {
+        needsRecovery = false;
         int valid = records.validBytes();
         if (valid < records.sizeInBytes()) {
             records.truncateTo(valid);
         }
-        rebuildIndex();
+        rebuildIndexes();
     }
 
-    public void rebuildIndex() throws IOException {
+    private void loadStateFromIndexes() throws IOException {
+        if (offsetIndex.isEmpty() && !isEmpty()) {
+            needsRecovery = true;
+            return;
+        }
+        IndexEntry lastEntry = offsetIndex.isEmpty() ? IndexEntry.EMPTY : offsetIndex.entryAt(offsetIndex.entries() - 1);
+        int from = lastEntry.offset() < 0 ? 0 : lastEntry.position();
+        bytesSinceLastIndexEntry = 0;
+        try {
+            Iterator<FileRecords.BatchPosition> iterator = records.batchIterator(from);
+            while (iterator.hasNext()) {
+                FileRecords.BatchPosition batchPosition = iterator.next();
+                observe(batchPosition.batch());
+                bytesSinceLastIndexEntry += batchPosition.sizeInBytes();
+            }
+        } catch (CorruptRecordException e) {
+            needsRecovery = true;
+        }
+    }
+
+    public boolean needsRecovery() {
+        return needsRecovery;
+    }
+
+    public void rebuildIndexes() throws IOException {
         offsetIndex.truncate();
         timeIndex.truncate();
         bytesSinceLastIndexEntry = 0;

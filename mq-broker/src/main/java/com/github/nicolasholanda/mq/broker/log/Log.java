@@ -4,6 +4,7 @@ import com.github.nicolasholanda.mq.common.record.RecordBatch;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -16,9 +17,13 @@ public final class Log implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(Log.class);
 
+    public static final String RECOVERY_POINT_FILE = "recovery-point-offset-checkpoint";
+
     private final File dir;
     private final LogConfig config;
     private final NavigableMap<Long, LogSegment> segments = new TreeMap<>();
+    private final CleanShutdownFile cleanShutdownFile;
+    private final File recoveryPointFile;
 
     private long logStartOffset;
     private long logEndOffset;
@@ -28,6 +33,8 @@ public final class Log implements Closeable {
     private Log(File dir, LogConfig config) {
         this.dir = dir;
         this.config = config;
+        this.cleanShutdownFile = new CleanShutdownFile(dir);
+        this.recoveryPointFile = new File(dir, RECOVERY_POINT_FILE);
     }
 
     public static Log open(File dir, LogConfig config) throws IOException {
@@ -51,17 +58,38 @@ public final class Log implements Closeable {
         if (baseOffsets.isEmpty()) {
             baseOffsets.add(0L);
         }
+        boolean cleanShutdown = cleanShutdownFile.exists();
+        recoveryPoint = readRecoveryPoint();
         for (long baseOffset : baseOffsets) {
             segments.put(baseOffset, openSegment(baseOffset));
         }
+        LogRecovery.RecoveryResult result =
+                LogRecovery.recover(new ArrayList<>(segments.values()), recoveryPoint, cleanShutdown);
+        if (!cleanShutdown) {
+            log.warn("Unclean shutdown detected in {}: scanned {} segments, truncated {}",
+                    dir.getName(), result.segmentsScanned(), result.segmentsTruncated());
+        }
+        cleanShutdownFile.remove();
         logStartOffset = segments.firstKey();
-        logEndOffset = activeSegment().nextOffset();
+        logEndOffset = result.logEndOffset();
         highWatermark = logEndOffset;
-        recoveryPoint = logEndOffset;
+        recoveryPoint = Math.min(recoveryPoint, logEndOffset);
+    }
+
+    private long readRecoveryPoint() throws IOException {
+        if (!recoveryPointFile.exists()) {
+            return 0L;
+        }
+        String content = Files.readString(recoveryPointFile.toPath()).trim();
+        return content.isEmpty() ? 0L : Long.parseLong(content);
+    }
+
+    private void writeRecoveryPoint(long offset) throws IOException {
+        Files.writeString(recoveryPointFile.toPath(), Long.toString(offset));
     }
 
     private LogSegment openSegment(long baseOffset) throws IOException {
-        return LogSegment.open(dir, baseOffset, config.indexIntervalBytes(), config.maxIndexSize());
+        return LogSegment.open(dir, baseOffset, config.indexIntervalBytes(), config.maxIndexSize(), false);
     }
 
     public LogAppendInfo append(RecordBatch batch, boolean assignOffsets) throws IOException {
@@ -167,6 +195,7 @@ public final class Log implements Closeable {
             segment.flush();
         }
         recoveryPoint = logEndOffset;
+        writeRecoveryPoint(recoveryPoint);
     }
 
     public LogSegment activeSegment() {
@@ -215,9 +244,11 @@ public final class Log implements Closeable {
 
     @Override
     public void close() throws IOException {
+        flush();
         for (LogSegment segment : segments.values()) {
             segment.close();
         }
         segments.clear();
+        cleanShutdownFile.create();
     }
 }
