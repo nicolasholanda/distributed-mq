@@ -1,4 +1,5 @@
 dependencies {
     api "io.netty:netty-buffer:${nettyVersion}"
+    api "io.netty:netty-codec:${nettyVersion}"
     api "org.slf4j:slf4j-api:${slf4jVersion}"
 }
